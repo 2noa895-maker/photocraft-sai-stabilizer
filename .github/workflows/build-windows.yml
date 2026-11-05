@@ -1,0 +1,25 @@
+# Compila PhotoCraft para Windows (x64) en GitHub y deja el .exe como descarga.
+# Uso: Actions > "Build Windows (fork)" > Run workflow. Al terminar, baja "photocraft-windows-x64".
+name: Build Windows (fork)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p photocraft
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-windows-x64
+          path: target/release/photocraft.exe
+          if-no-files-found: error
