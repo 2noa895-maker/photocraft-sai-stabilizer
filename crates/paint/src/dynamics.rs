@@ -4,9 +4,11 @@
 //! Everything is incremental (feed points in any chunking, get the same dabs) and deterministic:
 //! jitter comes from [`crate::rng`] keyed by the stroke seed and the step/dab index.
 
+use std::collections::VecDeque;
+
 use photocraft_geom::Point;
 
-use crate::brush::{BrushSettings, Control, Dynamic, Smoothing};
+use crate::brush::{BrushSettings, Control, Dynamic, MAX_STABILIZER, Smoothing};
 use crate::rng::{rand_signed, rand01, stream};
 use crate::{Dab, StrokePoint};
 
@@ -93,23 +95,86 @@ fn pose_differs(brush: &StrokePoint, p: &StrokePoint, eps: f32) -> bool {
         || (p.wheel - brush.wheel).abs() > eps
 }
 
-/// Incremental stroke smoothing: exponential (with optional time-based catch-up) or pulled string.
+/// How many of the latest input points the stabilizer averages at `level` (0 counts as off = 1).
+/// Levels 1..=15 take 2..=16 points; S-1..S-7 (16..=22) take 24, 32, ... 72. An approximation of
+/// how strong each level feels, tuned by eye, not taken from any other program's code.
+pub fn stabilizer_window(level: u8) -> usize {
+    match level.min(MAX_STABILIZER) {
+        0 => 1,
+        l @ 1..=15 => usize::from(l) + 1,
+        l => 16 + usize::from(l - 15) * 8,
+    }
+}
+
+/// Linearly weighted average of the window, oldest to newest (the newest point weighs most), so the
+/// brush trails the pen less than with a plain mean. Pose follows the same weights, except
+/// barrel rotation (an angle) and time, which are the newest point's. The weights are 1, 2, 3...,
+/// so `sum` is never 0 for a non-empty window.
+fn window_average(window: &VecDeque<StrokePoint>) -> Option<StrokePoint> {
+    let newest = *window.back()?;
+    let (mut sum, mut x, mut y) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut pressure, mut tilt_x, mut tilt_y, mut wheel) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for (i, p) in window.iter().enumerate() {
+        let w = (i + 1) as f64;
+        sum += w;
+        x += p.x * w;
+        y += p.y * w;
+        pressure += f64::from(p.pressure) * w;
+        tilt_x += f64::from(p.tilt_x) * w;
+        tilt_y += f64::from(p.tilt_y) * w;
+        wheel += f64::from(p.wheel) * w;
+    }
+    Some(StrokePoint {
+        x: x / sum,
+        y: y / sum,
+        pressure: (pressure / sum) as f32,
+        tilt_x: (tilt_x / sum) as f32,
+        tilt_y: (tilt_y / sum) as f32,
+        wheel: (wheel / sum) as f32,
+        ..newest
+    })
+}
+
+/// Incremental stroke smoothing: exponential (with optional time-based catch-up), pulled string or
+/// the moving-average stabilizer.
 #[derive(Clone, Debug)]
 pub struct Smoother {
     cfg: Smoothing,
     zoom: f64,
     pos: Option<StrokePoint>,
     last_input: Option<StrokePoint>,
+    /// The latest input points the stabilizer averages.
+    window: VecDeque<StrokePoint>,
 }
 
 impl Smoother {
     /// `zoom` is the view zoom (only used with `adjust_for_zoom`).
     pub fn new(cfg: &Smoothing, zoom: f32) -> Self {
-        Self { cfg: cfg.clone(), zoom: f64::from(zoom.max(0.01)), pos: None, last_input: None }
+        Self { cfg: cfg.clone(), zoom: f64::from(zoom.max(0.01)), pos: None, last_input: None, window: VecDeque::new() }
     }
 
     fn active(&self) -> bool {
-        self.cfg.enabled && self.cfg.amount > 0.0
+        self.cfg.enabled && (self.cfg.amount > 0.0 || self.cfg.stabilizer > 0)
+    }
+
+    /// Does the stabilizer (moving average) drive the brush instead of Smoothing %?
+    fn stabilizing(&self) -> bool {
+        self.cfg.stabilizer > 0
+    }
+
+    /// Stabilizer step: average the latest points and paint through the result.
+    fn push_stabilized(&mut self, p: StrokePoint, still: bool, out: &mut Vec<StrokePoint>) {
+        if still && !self.cfg.catch_up {
+            return;
+        }
+        self.window.push_back(p);
+        while self.window.len() > stabilizer_window(self.cfg.stabilizer) {
+            self.window.pop_front();
+        }
+        if let Some(avg) = window_average(&self.window) {
+            self.pos = Some(avg);
+            out.push(avg);
+        }
     }
 
     /// Feed one input point; returns the brush positions to paint through.
@@ -121,9 +186,17 @@ impl Smoother {
         }
         let Some(pos) = self.pos else {
             self.pos = Some(p);
+            if self.stabilizing() {
+                self.window.push_back(p);
+            }
             out.push(p);
             return;
         };
+        if self.stabilizing() {
+            let still = prev_input.is_some_and(|q| q.x == p.x && q.y == p.y);
+            self.push_stabilized(p, still, out);
+            return;
+        }
         let amount = f64::from(self.cfg.amount.clamp(0.0, 1.0));
         if self.cfg.pulled_string {
             let mut len = amount * MAX_STRING_PX;

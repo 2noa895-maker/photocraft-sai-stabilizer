@@ -42,6 +42,28 @@ pub(super) fn smoothing_field(ui: &mut egui::Ui, b: &mut photocraft_engine::Brus
     }
 }
 
+/// The stabilizer level as a user sees it: "Off", "1" to "15", then "S-1" to "S-7".
+pub(super) fn stabilizer_name(level: u8) -> String {
+    match level {
+        0 => tl!("Off").to_owned(),
+        1..=15 => level.to_string(),
+        l => format!("S-{}", u16::from(l.min(photocraft_paint::MAX_STABILIZER)) - 15),
+    }
+}
+
+/// Stabilizer level row (0 = off, 1 to 15, then S-1 to S-7): a moving average of the latest pen
+/// points that replaces Smoothing % and Pulled String Mode while it is on.
+pub(super) fn stabilizer_row(ui: &mut egui::Ui, s: &mut photocraft_paint::Smoothing) {
+    let mut level = f32::from(s.stabilizer.min(photocraft_paint::MAX_STABILIZER));
+    ui.horizontal(|ui| {
+        if widgets::slider_row(ui, tl!("Stabilizer"), &mut level, 0.0..=f32::from(photocraft_paint::MAX_STABILIZER), "", None).changed() {
+            s.enabled = true;
+            s.stabilizer = level.round().clamp(0.0, f32::from(photocraft_paint::MAX_STABILIZER)) as u8;
+        }
+        ui.label(stabilizer_name(s.stabilizer));
+    });
+}
+
 /// Options-bar gear beside Smoothing: Photoshop's smoothing options popup, edited on the brush
 /// like the Smoothing % (so they stay per tool and reach the live stroke and the commit).
 pub(super) fn smoothing_options(ui: &mut egui::Ui, b: &mut photocraft_engine::BrushSettings) {
@@ -49,6 +71,7 @@ pub(super) fn smoothing_options(ui: &mut egui::Ui, b: &mut photocraft_engine::Br
     let resp = crate::brush_picker::named(resp, "Set additional smoothing options");
     egui::Popup::from_toggle_button_response(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
         let s = &mut b.smoothing;
+        stabilizer_row(ui, s);
         widgets::checkbox(ui, &mut s.pulled_string, tl!("Pulled String Mode"));
         widgets::checkbox(ui, &mut s.catch_up, tl!("Stroke Catch-up"));
         widgets::checkbox(ui, &mut s.catch_up_on_end, tl!("Catch-up on Stroke End"));

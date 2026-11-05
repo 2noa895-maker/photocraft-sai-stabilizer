@@ -5,7 +5,7 @@ use photocraft_geom::{Point, Rect};
 use photocraft_raster::Surface;
 
 use crate::brush::*;
-use crate::dynamics::{Smoother, smooth_points};
+use crate::dynamics::{Smoother, smooth_points, stabilizer_window};
 use crate::render::{BrushContext, StrokeRenderer, mask_combine, render_stroke, texture_combine};
 use crate::tile::GrayTile;
 use crate::{Dab, Stroke, StrokePoint, dabs};
@@ -1994,4 +1994,113 @@ fn touches_covers_every_pixel_with_coverage() {
     assert!(!r.touches(Rect::new(400, 400, 400, 400)), "empty");
     assert!(r.touches(Rect::new(i32::MIN, i32::MIN, i32::MAX, i32::MAX)), "huge, without a huge scan");
     assert!(!r.touches(Rect::new(1_000_000, 1_000_000, i32::MAX, i32::MAX)));
+}
+
+// ---------------------------------------------------------------------------
+// Stabilizer (moving average, levels 1..=15 then S-1..S-7)
+// ---------------------------------------------------------------------------
+
+/// A shaky horizontal stroke: y alternates by +-3 px around 50 while x advances 2 px per point.
+fn shaky_stroke(n: usize) -> Vec<StrokePoint> {
+    (0..n).map(|i| StrokePoint::new(i as f64 * 2.0, 50.0 + if i % 2 == 0 { 3.0 } else { -3.0 }, 1.0)).collect()
+}
+
+fn stabilized(level: u8, pts: &[StrokePoint]) -> Vec<StrokePoint> {
+    smooth_points(&Smoothing { stabilizer: level, ..Default::default() }, 1.0, pts)
+}
+
+/// Vertical spread over the second half of the stroke, without the final catch-up point that
+/// finishes at the pen.
+fn y_spread(pts: &[StrokePoint]) -> f64 {
+    let body = &pts[..pts.len().saturating_sub(1)];
+    let ys = body.iter().skip(body.len() / 2).map(|p| p.y);
+    ys.clone().fold(f64::MIN, f64::max) - ys.fold(f64::MAX, f64::min)
+}
+
+#[test]
+fn stabilizer_window_grows_with_the_level_and_is_bounded() {
+    assert_eq!(stabilizer_window(0), 1);
+    let sizes: Vec<usize> = (0..=MAX_STABILIZER).map(stabilizer_window).collect();
+    assert!(sizes.windows(2).all(|w| w[0] < w[1]), "{sizes:?}");
+    assert_eq!(stabilizer_window(1), 2);
+    assert_eq!(stabilizer_window(15), 16);
+    assert_eq!(stabilizer_window(16), 24);
+    // Out-of-range levels (a hand-edited preset) behave as S-7 instead of growing without bound.
+    assert_eq!(stabilizer_window(255), stabilizer_window(MAX_STABILIZER));
+}
+
+#[test]
+fn stabilizer_off_paints_the_input_unchanged() {
+    let pts = shaky_stroke(20);
+    let out = stabilized(0, &pts);
+    assert_eq!(out.len(), pts.len());
+    for (a, b) in out.iter().zip(&pts) {
+        assert_eq!((a.x, a.y), (b.x, b.y));
+    }
+}
+
+#[test]
+fn stabilizer_removes_more_tremor_at_higher_levels() {
+    let pts = shaky_stroke(120);
+    let raw = y_spread(&pts);
+    let spreads: Vec<f64> = [1u8, 8, 15, 16, 22].iter().map(|&l| y_spread(&stabilized(l, &pts))).collect();
+    assert!(spreads[0] < raw, "level 1 {} vs raw {raw}", spreads[0]);
+    assert!(spreads.windows(2).all(|w| w[1] < w[0]), "{spreads:?}");
+    assert!(spreads[4] < 0.2, "S-7 leaves {} px of tremor", spreads[4]);
+}
+
+#[test]
+fn stabilizer_keeps_the_start_and_catches_up_at_the_end() {
+    let pts = shaky_stroke(60);
+    for level in [1u8, 15, 22] {
+        let out = stabilized(level, &pts);
+        assert_eq!((out[0].x, out[0].y), (pts[0].x, pts[0].y), "level {level} starts at the pen");
+        let (last, end) = (out.last().unwrap(), pts.last().unwrap());
+        assert_eq!((last.x, last.y), (end.x, end.y), "level {level} finishes at the pen");
+    }
+    // Without Catch-Up On Stroke End the brush stays behind the pen.
+    let behind = smooth_points(&Smoothing { stabilizer: 22, catch_up_on_end: false, ..Default::default() }, 1.0, &pts);
+    assert!(behind.last().unwrap().x < pts.last().unwrap().x - 5.0);
+}
+
+#[test]
+fn stabilizer_follows_a_straight_line_and_never_overshoots() {
+    let pts: Vec<StrokePoint> = (0..80).map(|i| StrokePoint::new(i as f64 * 3.0, 10.0, 1.0)).collect();
+    let out = stabilized(22, &pts);
+    assert!(out.iter().all(|p| (p.y - 10.0).abs() < 1e-9));
+    assert!(out.windows(2).all(|w| w[1].x >= w[0].x), "x never goes backwards");
+    assert!(out.iter().zip(&pts).all(|(o, i)| o.x <= i.x + 1e-9), "the brush trails the pen, never leads it");
+}
+
+#[test]
+fn stabilizer_respects_the_enabled_switch_and_old_presets() {
+    let pts = shaky_stroke(30);
+    let off = smooth_points(&Smoothing { enabled: false, stabilizer: 22, ..Default::default() }, 1.0, &pts);
+    assert!(off.iter().zip(&pts).all(|(a, b)| (a.x, a.y) == (b.x, b.y)));
+    // A preset saved before the field existed loads with the stabilizer off.
+    let old: Smoothing = serde_json::from_str(r#"{"amount":0.4,"pulledString":true}"#).unwrap();
+    assert_eq!((old.stabilizer, old.amount, old.pulled_string), (0, 0.4, true));
+    let json = serde_json::to_string(&Smoothing { stabilizer: 17, ..Default::default() }).unwrap();
+    assert_eq!(serde_json::from_str::<Smoothing>(&json).unwrap().stabilizer, 17);
+}
+
+#[test]
+fn stabilizer_never_panics_on_hostile_points() {
+    let hostile = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.0e300, -1.0e300, 0.0];
+    let pts: Vec<StrokePoint> = hostile.iter().flat_map(|&x| hostile.iter().map(move |&y| StrokePoint::new(x, y, f32::NAN))).collect();
+    for level in [1u8, 22, 255] {
+        let _ = stabilized(level, &pts);
+    }
+}
+
+#[test]
+fn stabilized_stroke_paints_a_smoother_line_at_every_depth() {
+    // The test surface is 64 x 40: a shaky line along y = 20.
+    let pts: Vec<StrokePoint> = (0..30).map(|i| StrokePoint::new(i as f64 * 2.0, 20.0 + if i % 2 == 0 { 3.0 } else { -3.0 }, 1.0)).collect();
+    let b = BrushSettings { size: 5.0, smoothing: Smoothing { stabilizer: 15, ..Default::default() }, ..brush() };
+    for fmt in [PixelFormat::RGBA8, PixelFormat::RGBA16, PixelFormat::RGBA32F] {
+        let mut s = Surface::new(fmt);
+        render_stroke(&mut s, &b, &pts, None, false, 1.0);
+        assert!(s.pixel(30, 20).iter().any(|&v| v > 0.0), "{fmt:?} paints through the middle");
+    }
 }

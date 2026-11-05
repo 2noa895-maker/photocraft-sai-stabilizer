@@ -54,3 +54,15 @@ fn an_explicit_stroke_smoothing_amount_overrides_the_tool_switch() {
     assert!(explicit.smoothing.enabled && explicit.smoothing.amount == 0.4);
     assert!(!s.tools.brush.smoothing.enabled, "a stroke override does not change the tool");
 }
+
+#[test]
+fn stabilizer_is_drivable_and_presets_keep_it() {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 64})).unwrap();
+    assert_eq!(s.tools.brush.smoothing.stabilizer, 0, "off by default");
+    s.execute("tools.setBrush", json!({"brush": {"smoothing": {"stabilizer": 18}}})).unwrap();
+    assert_eq!(s.tools.brush.smoothing.stabilizer, 18);
+    let preset = s.tools.presets.iter().find(|p| p.brush.smoothing.amount == 0.0).map(|p| p.name.clone()).unwrap();
+    s.execute("tools.setBrush", json!({"preset": preset})).unwrap();
+    assert_eq!(s.tools.brush.smoothing.stabilizer, 18, "the stabilizer is a tool option, like Smoothing %");
+}

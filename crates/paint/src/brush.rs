@@ -534,11 +534,17 @@ pub struct Smoothing {
     pub catch_up_on_end: bool,
     /// Divide the string length by the view zoom (the command's `zoom` param).
     pub adjust_for_zoom: bool,
+    /// Moving-average stabilizer, in the style of Paint Tool SAI: 0 = off, 1..=15 = levels 1 to 15,
+    /// 16..=22 = S-1 to S-7. While above 0 it replaces `amount` and `pulled_string`.
+    pub stabilizer: u8,
 }
+
+/// Highest [`Smoothing::stabilizer`] value (S-7).
+pub const MAX_STABILIZER: u8 = 22;
 
 impl Default for Smoothing {
     fn default() -> Self {
-        Self { enabled: true, amount: 0.0, pulled_string: false, catch_up: true, catch_up_on_end: true, adjust_for_zoom: true }
+        Self { enabled: true, amount: 0.0, pulled_string: false, catch_up: true, catch_up_on_end: true, adjust_for_zoom: true, stabilizer: 0 }
     }
 }
 
